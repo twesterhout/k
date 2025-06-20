@@ -1,167 +1,101 @@
 {-# LANGUAGE NoMonomorphismRestriction #-}
 module Language.Parse where
 
-import Data.Array qualified as A
-import Data.Array (Array)
-import Data.Char (isDigit, isAlphaNum, isAlpha)
-import Data.Maybe (fromJust)
+import Data.Sequence qualified as S
+import Data.Sequence (Seq)
 import Data.Text (Text)
-import Data.Text qualified as T
 import Text.Parsec qualified as P
-import Text.Parsec ((<?>))
-import Text.Parsec.Pos (SourcePos,initialPos)
+import Text.Parsec ((<?>),(<|>))
+import Text.Parsec.Pos (initialPos)
+import Data.Functor ((<&>))
 import Prelude hiding (lex)
-import Language.Lex
+import Language.Lex (Adverb(..), Tk(..), Token(..), Number(..), lex)
 
-data K = KInt !Int
-       | KFloat !Double
+data K = KNumber !Number
        | KSym !Text
        | KStr !Text
-       | KArray !(Array Int Tree)
+       | KArray !(Seq Tree)
        | KVerb !Char !Bool
-       | KAdverb !Text
+       | KAdverb !Adverb
+       | KFunc !(Maybe (Seq Text)) !(Seq Tree)
+       | KBlock !(Seq Tree)
   deriving stock (Show)
 
-data Tree = Const !K | Variable !Text | Apply !K [K]
+data Tree = Lit !K | Id !Text | At !Tree !(Seq Tree) | Ap !Tree !Tree | Ap2 !Tree !Tree !Tree
   deriving stock (Show)
 
-data KExpr = KExpr
-  deriving stock (Eq, Show)
---
--- {[args]body}
--- args is [x0;x1;x2;...] where x0, x1, etc are all Names
-data KFunc = KFunc (Maybe [Text]) KExpr
-  deriving stock (Eq, Show)
-
-satisfy :: (P.Stream s m Token) => (Token -> Bool) -> P.ParsecT s u m Token
-{-# INLINABLE satisfy #-}
-satisfy f = P.tokenPrim show (\pos _c _cs -> pos) (\c -> if f c then Just c else Nothing)
-
-
-semi = satisfy (\(Token t _) -> t == TSemicolon) <?> "semicolon"
-ws = satisfy f <?> "whitespace" where f (Token TSpace _) = True; f (Token TNewline _) = True; f _ = False
+token = P.tokenPrim show (\pos _c _cs -> pos) 
+satisfy f = token (\c -> if f c then Just c else Nothing)
+satisfy' f = satisfy (\(Token t _) -> f t)
+semi = satisfy' (== TSemicolon) <?> "semicolon"
+semi' = sws *> semi <* sws
+sp = satisfy' (== TSpace) <?> "space"
+ws = satisfy' (\t -> t == TSpace || t == TNewline) <?> "whitespace"
 sws = P.optional ws
 name = satisfy f <?> "name" where f (Token (TName _) _) = True; f _ = False
+lparen = satisfy' (== TLParen) <?> "("; rparen = satisfy' (== TRParen) <?> ")"
+lbrace = satisfy' (== TLBrace) <?> "{"; rbrace = satisfy' (== TRBrace) <?> "}"
+lbracket = satisfy' (== TLBracket) <?> "["; rbracket = satisfy' (== TRBracket) <?> "]"
+pUnary = token f <?> "unary verb" where f (Token (TVerb c True) _) = Just . Lit $ KVerb c True; f _ = Nothing
+pBinary = token f <?> "binary verb" where f (Token (TVerb c False) _) = Just . Lit $ KVerb c False; f _ = Nothing
+pAdverb = token f <?> "adverb" where f (Token (TAdverb a) _) = Just . Lit $ KAdverb a; f _ = Nothing
+pStmts = S.fromList <$> P.sepBy pTree semi'
 
-pLambda = do
-  P.between l r $ do
-    args <- P.optionMaybe pFunArgs
-    pure $ KFunc args KExpr
+
+cont f = P.option f $ Ap f <$> (P.optional sp *> pTree)
+cont2 f x = P.option (Ap f x) (Ap2 f x <$> pTree)
+
+pBlock = P.between (lbracket <* sws) (sws *> rbracket) (S.fromList <$> P.sepBy pTree semi')
+pAt f = At f <$> pBlock
+
+pNoun = do n <- c1 <|> c2 <|> c3 <|> c4; (At n <$> pBlock) <|> pure n
   where
-    l = satisfy f where f (Token TLBrace _) = True; f _ = False
-    r = satisfy f where f (Token TRBrace _) = True; f _ = False
+    -- literals
+    c1 = token $ \case
+      Token (TNumber x) _ -> Just $ Lit (KNumber x)
+      Token (TNumbers xs) _ -> Just . Lit . KArray $ Lit . KNumber <$> xs
+      Token (TSym s) _ -> Just . Lit . KSym $ s
+      Token (TSyms ss) _ -> Just . Lit . KArray $ Lit . KSym <$> ss
+      Token (TStr s) _ -> Just $ Lit (KStr s)
+      Token (TName n) _ -> Just $ Id n
+      _ -> Nothing
+    -- (...)
+    c2 = P.between (lparen <* sws) rparen $ do
+      P.sepBy pTree semi' >>= \case
+        [] -> pure . Lit . KArray $ S.Empty
+        [t] -> pure t
+        ts -> pure . Lit . KArray $ S.fromList ts
+    -- {...}
+    -- {[args]body}
+    c3 = P.between lbrace rbrace $ do
+      let getName (Token (TName t) _) = t; getName _ = error "bug"
+          args = P.between (lbracket <* sws) (sws *> rbracket) (S.fromList . fmap getName <$> P.sepBy name semi')
+      fmap Lit $ KFunc <$> P.optionMaybe args <*> pStmts
+    -- [...]
+    c4 = Lit . KBlock <$> pBlock
 
-
-
-pFunArgs = fmap p <$> P.between l r (P.sepBy (sws *> name <* sws) semi)
+--     x y z ... 
+-- c1  u        -> Apply x [parse y z ...]
+-- c2  b a      -> Apply (Apply y [x]) [parse z ...]
+--     b        -> Apply x [parse y z ...]
+-- c31 n a      -> Apply (Apply y [x]) [parse z ...]
+-- c32 n b a    -> Apply (Apply z [y]) [x, parse ...]
+--     n b      -> Apply y [x, parse z ...]
+-- c33 n n a    -> Apply (Apply z [y]) [x, parse ...]
+--     n n      -> Apply x [parse y z ...]
+-- c34 n
+pTree :: P.Stream s m Token => P.ParsecT s u m Tree
+pTree = c1 <|> c2 <|> c3
   where
-    p (Token (TName t) _) = t; p _ = error "bug"
-    l = satisfy f where f (Token TLBracket _) = True; f _ = False
-    r = satisfy f where f (Token TRBracket _) = True; f _ = False
-
-
-{-
-tkSep TNewline = True; tkSep TSemicolon = True; tkSep TSpace = True; tkSep (TComment _) = True; tkSep _ = False
-tkNoun (TInt _) = True; tkNoun (TFloat _) = True; tkNoun (TStr _) = True; tkNoun (TSym _) = True; tkNoun (TName _) = True; tkNoun (TKList _) = True; tkNoun _ = False
-tkVerb (TVerb _ _) = True; tkVerb _ = False
-tkAdverb (TAdverb _) = True; tkAdverb _ = False
-
-number = flip P.label "Number" $ do
-  let d = P.many1 (P.satisfy isDigit)
-      o a b = P.optionMaybe $ liftA2 (:) a b
-      s = liftA2 (<>) (P.option "" (pure <$> P.char '-'))
-  n <- d; f <- o (P.char '.') d; e <- o (P.satisfy (\c -> c == 'e' || c == 'E')) (s d)
-  pure $ if isNothing f && isNothing e
-    then TInt (T.pack n) else TFloat (T.pack $ n <> fromMaybe "" f <> fromMaybe "" e)
-
-string' = do
-  _ <- P.char '"'
-  let go s = P.anyToken >>= \c -> case c of
-        '\\' -> do { c' <- P.char '\\' <|> P.char '"'; go (c':s) }
-        '"' -> pure s
-        _ -> go (c:s)
-  T.reverse . T.pack <$> go ""
-string = fmap TStr string' <?> "String"
-
-name' = T.pack <$> liftA2 (:) (P.satisfy isAlpha) (P.many (P.satisfy isAlphaNum))
-name = fmap TName name' <?> "Name"
-
-symbol' = P.char '`' *> P.option T.empty (string' <|> name')
-symbol = fmap TSym symbol' <?> "Symbol"
-
--- <Noun> ::= <Names> | <Ints> | <Floats> | <String> | <Symbols>
-noun = string <|> symbol <|> number <|> name <?> "Noun"
-
--- <Verb>   ::=  <Verb1> | <Verb1> ":"
--- <Verb1>  ::=  ":" | "+" | "-" | "*" | "%" | "!" | "&" | "|" | "<" | ">" | "=" | "~" | "," |
---               "^" | "#" | "_" | "$" | "?" | "@" | "." | <Digit> ":"
-verb = liftA2 TVerb (P.oneOf "+-*%&|<>=^!~,#_$?@.") (P.option False (P.char ':' $> True)) <?> "Verb"
-
--- <Adverb> ::=  "'" | "/" | "\" | "':" | "/:" | "\:"
-adverb' = T.pack <$> liftA2 (:) (P.oneOf "'/\\") (P.option "" (pure <$> P.char ':'))
-adverb = fmap TAdverb adverb' <?> "Adverb"
-
-newline = P.endOfLine $> TNewline
-semicolon = P.char ';' $> TSemicolon
-space = P.many1 (P.char ' ' <|> P.char '\t') $> TSpace
-space0 = P.many (P.char ' ' <|> P.char '\t') $> ()
-klist = P.between (P.char '(' *> space0) (space0 <* P.char ')') (fmap TKList tokens) <?> "(...)"
-plist = P.between (P.char '[' *> space0) (space0 <* P.char ']') (fmap TPList tokens) <?> "[...]"
-func = P.between (P.char '{' *> space0) (space0 <* P.char '}') (fmap TFunc tokens) <?> "Lambda"
-
-tokens = fmap spanV $ P.many $ space <|> newline <|> semicolon <|> func <|> klist <|> plist <|> verb <|> adverb <|> noun
-
-isI (TInt _) = True; isI _ = False
-isF (TFloat _) = True; isF _ = False
-
-spanV = go1
-  where
-    go1 (a:b:c:xs)
-      | TInt _ <- a, TSpace <- b, TInt _ <- c = let (y, xs') = go2 isI [c, a] xs in TKList (reverse y) : go1 xs'
-    go1 xs = xs
-    go2 f s (a:b:xs) | TSpace <- a, f b = go2 f (b:s) xs
-    go2 _ s xs = (s, xs)
-
--- Skip whitespace (spaces, newlines, and comments)
-sw = dropWhile f where f TSpace = True; f TNewline = True; f (TComment _) = True; f _ = False
-
-parse :: [Tk] -> Maybe Tree
-parse [] = Nothing
-parse [t] = case t of
-  TNewline -> Nothing
-  TSemicolon -> Nothing
-  TSpace -> Nothing
-  TComment _ -> Nothing
-  TInt s -> Just . Const . KInt . read . T.unpack $ s
-  TFloat s -> Just . Const . KFloat . read . T.unpack $ s
-  TStr s -> Just . Const . KStr $ s
-  TSym s -> Just . Const . KSym $ s
-  TName s -> Just . Variable $ s
-  -- TKList ts -> Just . Const . KArray $ A.listArray (0, length ts - 1) ts
-  _ -> undefined
-
--- data E = E !Tk
---        | A !Tk !E
---   deriving stock (Show)
--- 
--- pExpr = do
---   t <- noun <|> verb
---   e <- P.spaces *> P.optionMaybe pExpr
---   pure $ maybe (E t) (A t) e
--- pExprs = reverse <$> go []
---   where
---     go s = do
---       e <- P.spaces *> P.optionMaybe pExpr
---       let next = do
---             v <- (== '\n') <$> (P.char ';' <|> P.endOfLine)
---             go $ maybe s (\x -> (x, v):s) e
---           last = P.eof *> pure (maybe s (\x -> (x, True):s) e)
---       next <|> last
-
--- APL TWO BY TWO -- SYNTAX ANALYSIS BY PAIRWISE REDUCTION, J. D. Bunda and J. A. Gerth
--- https://dl.acm.org/doi/pdf/10.1145/384283.801081
---
--- Applied to K
--- https://nsl.com/papers/kparse.txt
--}
-
+    c1 = pUnary >>= cont
+    c2 = do b <- pBinary; (cont . (`Ap` b) =<< pAdverb) <|> cont b
+    c3 = do
+      n <- pNoun <* P.optional sp
+      let -- n a
+          c31 = (Ap <$> pAdverb <*> pure n) >>= cont
+          -- n b a | n b
+          c32 = do b <- pBinary; k b n <|> cont2 b n
+          -- n n a | n n
+          c33 = do n' <- pNoun; k n' n <|> (Ap n <$> cont n')
+      c31 <|> c32 <|> c33 <|> cont n
+    k b x = do a <- pAdverb; cont2 (Ap a b) x
